@@ -55,3 +55,10 @@ O MP4 usa:
 - imagem original centralizada;
 - fundo desfocado preenchendo 9:16;
 - duração igual à duração do áudio.
+
+## Correção 1.0.1 — FFmpeg ENOENT na Vercel
+
+Se a versão anterior retornou `spawn .../ffmpeg ENOENT`, o Next.js empacotou a Function sem o executável nativo.
+A versão 1.0.1 adiciona `next.config.mjs` com `serverExternalPackages` e `outputFileTracingIncludes`, forçando `ffmpeg-static` e seu binário a entrarem no bundle da rota `/api/render`.
+
+Depois de substituir os arquivos no repositório, faça um novo deploy na Vercel. Para evitar artefatos antigos, prefira **Redeploy sem usar Build Cache**.

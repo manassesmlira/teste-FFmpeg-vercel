@@ -1,8 +1,8 @@
-import { promises as fs } from 'fs';
+import { promises as fs, constants as fsConstants } from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
-import ffmpegPath from 'ffmpeg-static';
+import ffmpegStaticPath from 'ffmpeg-static';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -16,14 +16,51 @@ function extFor(file, fallback) {
   return ext && ext.length <= 6 ? ext : fallback;
 }
 
-function runFfmpeg(args) {
+async function resolveFfmpegPath() {
+  const candidates = [
+    ffmpegStaticPath,
+    path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg'),
+    path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Continue to next candidate.
+    }
+  }
+
+  // Sometimes an executable bit can be lost during packaging. If the file exists,
+  // /tmp is writable, so copy it there and restore executable permission.
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.F_OK);
+      const tempBinary = path.join(os.tmpdir(), 'cp-social-ffmpeg');
+      await fs.copyFile(candidate, tempBinary);
+      await fs.chmod(tempBinary, 0o755);
+      return tempBinary;
+    } catch {
+      // Continue.
+    }
+  }
+
+  throw new Error(
+    `FFmpeg não foi encontrado na Function. Caminhos verificados: ${candidates.join(' | ')}`
+  );
+}
+
+function runFfmpeg(binary, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       if (stderr.length > 12000) stderr = stderr.slice(-12000);
     });
+
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
@@ -34,10 +71,10 @@ function runFfmpeg(args) {
 
 export async function POST(request) {
   const workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'cpsocial-'));
+
   try {
-    if (!ffmpegPath) {
-      return Response.json({ error: 'ffmpeg-static não encontrou um binário compatível.' }, { status: 500 });
-    }
+    const ffmpegPath = await resolveFfmpegPath();
+    console.log('[CP Social Render] FFmpeg:', ffmpegPath);
 
     const form = await request.formData();
     const image = form.get('image');
@@ -54,6 +91,7 @@ export async function POST(request) {
     if (!String(image.type).startsWith('image/')) {
       return Response.json({ error: 'O primeiro arquivo precisa ser uma imagem.' }, { status: 400 });
     }
+
     if (!String(audio.type).startsWith('audio/')) {
       return Response.json({ error: 'O segundo arquivo precisa ser um áudio.' }, { status: 400 });
     }
@@ -71,7 +109,7 @@ export async function POST(request) {
       '[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]'
     ].join(';');
 
-    await runFfmpeg([
+    await runFfmpeg(ffmpegPath, [
       '-hide_banner',
       '-loglevel', 'error',
       '-loop', '1',
@@ -98,7 +136,7 @@ export async function POST(request) {
     if (output.byteLength > 4.3 * 1024 * 1024) {
       return Response.json({
         error: 'O vídeo foi gerado, mas ficou grande demais para ser devolvido diretamente pela Function da Vercel.',
-        details: `Tamanho aproximado: ${(output.byteLength / 1024 / 1024).toFixed(2)} MB. O próximo passo seria salvar em Blob/storage.`
+        details: `Tamanho aproximado: ${(output.byteLength / 1024 / 1024).toFixed(2)} MB. O próximo passo será salvar em Blob/storage.`
       }, { status: 507 });
     }
 
@@ -112,7 +150,7 @@ export async function POST(request) {
       }
     });
   } catch (error) {
-    console.error(error);
+    console.error('[CP Social Render]', error);
     return Response.json({
       error: 'Falha ao renderizar o vídeo.',
       details: error instanceof Error ? error.message : String(error)
