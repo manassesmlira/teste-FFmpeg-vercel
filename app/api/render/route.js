@@ -140,14 +140,12 @@ export async function POST(request) {
      * durante todos os frames do vídeo.
      */
 
-    const prepareFilter = [
-      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase',
-      'crop=1080:1920',
-      'boxblur=18:6[bg]',
-      '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]',
-      '[bg][fg]overlay=(W-w)/2:(H-h)/2',
-      'format=yuv420p'
-    ].join(';');
+const prepareFilter = [
+  '[0:v]split=2[bgsrc][fgsrc]',
+  '[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:6[bg]',
+  '[fgsrc]scale=1080:1920:force_original_aspect_ratio=decrease[fg]',
+  '[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[out]'
+].join(';');
 
     await runFfmpeg(ffmpegPath, [
       '-hide_banner',
@@ -156,6 +154,7 @@ export async function POST(request) {
       '-i', imagePath,
 
       '-filter_complex', prepareFilter,
+      '-map', '[out]',
 
       '-frames:v', '1',
 
