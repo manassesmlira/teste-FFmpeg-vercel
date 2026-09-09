@@ -27,13 +27,9 @@ async function resolveFfmpegPath() {
     try {
       await fs.access(candidate, fsConstants.X_OK);
       return candidate;
-    } catch {
-      // Continue to next candidate.
-    }
+    } catch {}
   }
 
-  // Sometimes an executable bit can be lost during packaging. If the file exists,
-  // /tmp is writable, so copy it there and restore executable permission.
   for (const candidate of candidates) {
     try {
       await fs.access(candidate, fsConstants.F_OK);
@@ -41,121 +37,238 @@ async function resolveFfmpegPath() {
       await fs.copyFile(candidate, tempBinary);
       await fs.chmod(tempBinary, 0o755);
       return tempBinary;
-    } catch {
-      // Continue.
-    }
+    } catch {}
   }
 
-  throw new Error(
-    `FFmpeg não foi encontrado na Function. Caminhos verificados: ${candidates.join(' | ')}`
-  );
+  throw new Error('FFmpeg não foi encontrado na Function.');
 }
 
 function runFfmpeg(binary, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(binary, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+
     let stderr = '';
 
-    child.stderr.on('data', (chunk) => {
+    child.stderr.on('data', chunk => {
       stderr += chunk.toString();
-      if (stderr.length > 12000) stderr = stderr.slice(-12000);
+
+      if (stderr.length > 12000) {
+        stderr = stderr.slice(-12000);
+      }
     });
 
     child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg encerrou com código ${code}. ${stderr.slice(-3500)}`));
+
+    child.on('close', code => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            `FFmpeg encerrou com código ${code}. ${stderr.slice(-3500)}`
+          )
+        );
+      }
     });
   });
 }
 
 export async function POST(request) {
-  const workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'cpsocial-'));
+  const workdir = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'cpsocial-')
+  );
 
   try {
     const ffmpegPath = await resolveFfmpegPath();
-    console.log('[CP Social Render] FFmpeg:', ffmpegPath);
 
     const form = await request.formData();
+
     const image = form.get('image');
     const audio = form.get('audio');
 
     if (!(image instanceof File) || !(audio instanceof File)) {
-      return Response.json({ error: 'Envie os campos image e audio.' }, { status: 400 });
+      return Response.json(
+        { error: 'Envie os campos image e audio.' },
+        { status: 400 }
+      );
     }
 
     if (image.size + audio.size > MAX_INPUT_BYTES) {
-      return Response.json({ error: 'Imagem + áudio excedem 4 MB neste teste.' }, { status: 413 });
+      return Response.json(
+        { error: 'Imagem + áudio excedem 4 MB neste teste.' },
+        { status: 413 }
+      );
     }
 
-    if (!String(image.type).startsWith('image/')) {
-      return Response.json({ error: 'O primeiro arquivo precisa ser uma imagem.' }, { status: 400 });
-    }
+    const imagePath = path.join(
+      workdir,
+      `image${extFor(image, '.jpg')}`
+    );
 
-    if (!String(audio.type).startsWith('audio/')) {
-      return Response.json({ error: 'O segundo arquivo precisa ser um áudio.' }, { status: 400 });
-    }
+    const audioPath = path.join(
+      workdir,
+      `audio${extFor(audio, '.mp3')}`
+    );
 
-    const imagePath = path.join(workdir, `image${extFor(image, '.jpg')}`);
-    const audioPath = path.join(workdir, `audio${extFor(audio, '.mp3')}`);
-    const outputPath = path.join(workdir, 'reel.mp4');
+    const preparedImage = path.join(
+      workdir,
+      'prepared.jpg'
+    );
 
-    await fs.writeFile(imagePath, Buffer.from(await image.arrayBuffer()));
-    await fs.writeFile(audioPath, Buffer.from(await audio.arrayBuffer()));
+    const outputPath = path.join(
+      workdir,
+      'reel.mp4'
+    );
 
-    const filter = [
-      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:8[bg]',
+    await fs.writeFile(
+      imagePath,
+      Buffer.from(await image.arrayBuffer())
+    );
+
+    await fs.writeFile(
+      audioPath,
+      Buffer.from(await audio.arrayBuffer())
+    );
+
+    /*
+     * ETAPA 1
+     *
+     * Prepara UMA única imagem em 1080x1920.
+     * O blur é feito uma vez, em vez de ser recalculado
+     * durante todos os frames do vídeo.
+     */
+
+    const prepareFilter = [
+      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase',
+      'crop=1080:1920',
+      'boxblur=18:6[bg]',
       '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]',
-      '[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]'
+      '[bg][fg]overlay=(W-w)/2:(H-h)/2',
+      'format=yuv420p'
     ].join(';');
 
     await runFfmpeg(ffmpegPath, [
       '-hide_banner',
       '-loglevel', 'error',
-      '-loop', '1',
-      '-framerate', '30',
+
       '-i', imagePath,
+
+      '-filter_complex', prepareFilter,
+
+      '-frames:v', '1',
+
+      '-q:v', '3',
+
+      '-y',
+      preparedImage
+    ]);
+
+    /*
+     * ETAPA 2
+     *
+     * Agora o FFmpeg trabalha com uma imagem já pronta.
+     * Não existe blur, crop ou overlay sendo recalculado
+     * 30 vezes por segundo.
+     */
+
+    await runFfmpeg(ffmpegPath, [
+      '-hide_banner',
+      '-loglevel', 'error',
+
+      '-loop', '1',
+
+      '-framerate', '24',
+
+      '-i', preparedImage,
+
       '-i', audioPath,
-      '-filter_complex', filter,
-      '-map', '[v]',
+
+      '-map', '0:v:0',
       '-map', '1:a:0',
+
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
+
+      '-preset', 'ultrafast',
+
       '-tune', 'stillimage',
-      '-crf', '28',
-      '-r', '30',
+
+      '-crf', '27',
+
+      '-pix_fmt', 'yuv420p',
+
+      '-r', '24',
+
       '-c:a', 'aac',
+
       '-b:a', '96k',
+
       '-ar', '44100',
+
       '-movflags', '+faststart',
+
       '-shortest',
-      '-y', outputPath
+
+      '-y',
+      outputPath
     ]);
 
     const output = await fs.readFile(outputPath);
+
     if (output.byteLength > 4.3 * 1024 * 1024) {
-      return Response.json({
-        error: 'O vídeo foi gerado, mas ficou grande demais para ser devolvido diretamente pela Function da Vercel.',
-        details: `Tamanho aproximado: ${(output.byteLength / 1024 / 1024).toFixed(2)} MB. O próximo passo será salvar em Blob/storage.`
-      }, { status: 507 });
+      return Response.json(
+        {
+          error:
+            'O vídeo foi gerado, mas ficou grande demais para ser devolvido diretamente pela Function.',
+          details:
+            `Tamanho: ${(output.byteLength / 1024 / 1024).toFixed(2)} MB`
+        },
+        { status: 507 }
+      );
     }
 
     return new Response(output, {
       status: 200,
+
       headers: {
         'Content-Type': 'video/mp4',
-        'Content-Disposition': 'attachment; filename="cp-social-reel-teste.mp4"',
+
+        'Content-Disposition':
+          'attachment; filename="cp-social-reel-teste.mp4"',
+
         'Cache-Control': 'no-store',
-        'X-CP-Social-Renderer': 'ffmpeg-static'
+
+        'X-CP-Social-Renderer':
+          'ffmpeg-static-optimized'
       }
     });
+
   } catch (error) {
+
     console.error('[CP Social Render]', error);
-    return Response.json({
-      error: 'Falha ao renderizar o vídeo.',
-      details: error instanceof Error ? error.message : String(error)
-    }, { status: 500 });
+
+    return Response.json(
+      {
+        error: 'Falha ao renderizar o vídeo.',
+
+        details:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      },
+      { status: 500 }
+    );
+
   } finally {
-    await fs.rm(workdir, { recursive: true, force: true }).catch(() => {});
+
+    await fs.rm(
+      workdir,
+      {
+        recursive: true,
+        force: true
+      }
+    ).catch(() => {});
+
   }
 }
