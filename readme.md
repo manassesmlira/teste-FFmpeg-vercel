@@ -62,3 +62,6 @@ Se a versão anterior retornou `spawn .../ffmpeg ENOENT`, o Next.js empacotou a 
 A versão 1.0.1 adiciona `next.config.mjs` com `serverExternalPackages` e `outputFileTracingIncludes`, forçando `ffmpeg-static` e seu binário a entrarem no bundle da rota `/api/render`.
 
 Depois de substituir os arquivos no repositório, faça um novo deploy na Vercel. Para evitar artefatos antigos, prefira **Redeploy sem usar Build Cache**.
+
+## Versão 1.1.0
+Além de `imagem + áudio`, o endpoint aceita `mode=video_overlay` com `video_url`, `fit_mode` (`crop`, `blur` ou `contain`), `overlay` em JSON e áudio opcional (`audio_url` ou upload). Isso permite reutilizar vídeos-base horizontais e convertê-los em Reels 9:16 com texto sobreposto.
