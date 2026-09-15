@@ -4,6 +4,7 @@ import os from 'os';
 import dns from 'dns/promises';
 import { spawn } from 'child_process';
 import ffmpegStaticPath from 'ffmpeg-static';
+import sharp from 'sharp';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -211,6 +212,15 @@ async function downloadTo(raw, destination) {
   return destination;
 }
 
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 function wrapText(text, maxCharacters) {
   const words = String(text || '')
     .replace(/\s+/g, ' ')
@@ -241,31 +251,194 @@ function wrapText(text, maxCharacters) {
     lines.push(line);
   }
 
-  return lines.join('\n');
+  return lines;
 }
 
-function buildVideoBaseFilter(fitMode) {
+function makeTextLines({
+  lines,
+  x,
+  startY,
+  fontSize,
+  lineHeight,
+  fontWeight,
+}) {
+  return lines
+    .map((line, index) => {
+      const y =
+        startY +
+        index * lineHeight;
+
+      return `
+        <text
+          x="${x}"
+          y="${y}"
+          text-anchor="middle"
+          font-family="Arial, Helvetica, sans-serif"
+          font-size="${fontSize}"
+          font-weight="${fontWeight}"
+          fill="#ffffff"
+          stroke="#000000"
+          stroke-opacity="0.50"
+          stroke-width="2"
+          paint-order="stroke fill"
+        >${escapeXml(line)}</text>
+      `;
+    })
+    .join('');
+}
+
+async function createOverlayPng({
+  overlay,
+  destination,
+}) {
+  const titleLines = wrapText(
+    overlay.title || '',
+    24
+  );
+
+  const bodyLines = wrapText(
+    overlay.text || '',
+    34
+  );
+
+  const titleFontSize = 72;
+  const titleLineHeight = 88;
+
+  const bodyFontSize = 48;
+  const bodyLineHeight = 64;
+
+  const titleHeight =
+    titleLines.length *
+    titleLineHeight;
+
+  const bodyHeight =
+    bodyLines.length *
+    bodyLineHeight;
+
+  const gap =
+    titleLines.length &&
+    bodyLines.length
+      ? 55
+      : 0;
+
+  const totalTextHeight =
+    titleHeight +
+    gap +
+    bodyHeight;
+
+  let blockTop;
+
+  if (overlay.position === 'top') {
+    blockTop = 250;
+  } else if (
+    overlay.position === 'bottom'
+  ) {
+    blockTop =
+      OUTPUT_HEIGHT -
+      totalTextHeight -
+      300;
+  } else {
+    blockTop =
+      (OUTPUT_HEIGHT -
+        totalTextHeight) /
+      2;
+  }
+
+  const titleStartY =
+    blockTop +
+    titleFontSize;
+
+  const bodyStartY =
+    blockTop +
+    titleHeight +
+    gap +
+    bodyFontSize;
+
+  const darkLayer =
+    overlay.dark !== false
+      ? `
+        <rect
+          x="0"
+          y="0"
+          width="${OUTPUT_WIDTH}"
+          height="${OUTPUT_HEIGHT}"
+          fill="#000000"
+          fill-opacity="0.34"
+        />
+      `
+      : '';
+
+  const titleSvg =
+    makeTextLines({
+      lines: titleLines,
+      x: OUTPUT_WIDTH / 2,
+      startY: titleStartY,
+      fontSize: titleFontSize,
+      lineHeight: titleLineHeight,
+      fontWeight: 700,
+    });
+
+  const bodySvg =
+    makeTextLines({
+      lines: bodyLines,
+      x: OUTPUT_WIDTH / 2,
+      startY: bodyStartY,
+      fontSize: bodyFontSize,
+      lineHeight: bodyLineHeight,
+      fontWeight: 500,
+    });
+
+  const svg = `
+    <svg
+      width="${OUTPUT_WIDTH}"
+      height="${OUTPUT_HEIGHT}"
+      viewBox="0 0 ${OUTPUT_WIDTH} ${OUTPUT_HEIGHT}"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      ${darkLayer}
+      ${titleSvg}
+      ${bodySvg}
+    </svg>
+  `;
+
+  await sharp(
+    Buffer.from(svg)
+  )
+    .png()
+    .toFile(destination);
+}
+
+function buildVideoBaseFilter(
+  fitMode,
+  overlayInputIndex
+) {
+  let base;
+
   if (fitMode === 'blur') {
-    return (
+    base =
       `[0:v]split=2[bgsrc][fgsrc];` +
       `[bgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
       `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},` +
       `boxblur=18:6[bg];` +
       `[fgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg];` +
-      `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`
-    );
-  }
-
-  if (fitMode === 'contain') {
-    return (
+      `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`;
+  } else if (
+    fitMode === 'contain'
+  ) {
+    base =
       `[0:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
-      `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black[base]`
-    );
+      `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black[base]`;
+  } else {
+    base =
+      `[0:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
+      `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}[base]`;
   }
 
   return (
-    `[0:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
-    `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}[base]`
+    `${base};` +
+    `[base][${overlayInputIndex}:v]` +
+    `overlay=0:0:format=auto,` +
+    `format=yuv420p[v]`
   );
 }
 
@@ -307,7 +480,10 @@ async function renderVideoOverlay({
     'video.mp4'
   );
 
-  await downloadTo(videoUrl, videoPath);
+  await downloadTo(
+    videoUrl,
+    videoPath
+  );
 
   let audioPath = '';
 
@@ -315,7 +491,8 @@ async function renderVideoOverlay({
     form.get('audio_url') || ''
   ).trim();
 
-  const audio = form.get('audio');
+  const audio =
+    form.get('audio');
 
   if (audioUrl) {
     audioPath = path.join(
@@ -327,11 +504,17 @@ async function renderVideoOverlay({
       audioUrl,
       audioPath
     );
-  } else if (audio instanceof File) {
-    if (audio.size > MAX_FORM_BYTES) {
+  } else if (
+    audio instanceof File
+  ) {
+    if (
+      audio.size >
+      MAX_FORM_BYTES
+    ) {
       return Response.json(
         {
-          error: 'Áudio excede 4 MB.',
+          error:
+            'Áudio excede 4 MB.',
         },
         {
           status: 413,
@@ -341,7 +524,10 @@ async function renderVideoOverlay({
 
     audioPath = path.join(
       workdir,
-      `audio${extFor(audio, '.webm')}`
+      `audio${extFor(
+        audio,
+        '.webm'
+      )}`
     );
 
     await fs.writeFile(
@@ -358,147 +544,59 @@ async function renderVideoOverlay({
     overlay =
       JSON.parse(
         String(
-          form.get('overlay') || '{}'
+          form.get('overlay') ||
+            '{}'
         )
       ) || {};
   } catch {
     overlay = {};
   }
 
-  const requestedFitMode = String(
-    form.get('fit_mode') || ''
-  );
+  const requestedFitMode =
+    String(
+      form.get('fit_mode') ||
+        ''
+    );
 
   const fitMode = [
     'crop',
     'blur',
     'contain',
-  ].includes(requestedFitMode)
+  ].includes(
+    requestedFitMode
+  )
     ? requestedFitMode
     : 'crop';
 
-  const title = wrapText(
-    overlay.title || '',
-    24
-  );
-
-  const body = wrapText(
-    overlay.text || '',
-    34
-  );
-
-  const titleFile = path.join(
-    workdir,
-    'title.txt'
-  );
-
-  const bodyFile = path.join(
-    workdir,
-    'body.txt'
-  );
-
-  await fs.writeFile(
-    titleFile,
-    title
-  );
-
-  await fs.writeFile(
-    bodyFile,
-    body
-  );
-
-  const baseFilter =
-    buildVideoBaseFilter(
-      fitMode
+  const overlayPath =
+    path.join(
+      workdir,
+      'overlay.png'
     );
 
-  const position =
-    overlay.position === 'top'
-      ? '260'
-      : overlay.position ===
-          'bottom'
-        ? 'h-text_h-320'
-        : '(h-text_h)/2';
-
-  let filterChain = baseFilter;
+  await createOverlayPng({
+    overlay,
+    destination:
+      overlayPath,
+  });
 
   /*
-   * Importante:
-   * não pode existir uma vírgula logo depois de [base].
-   * O código antigo gerava:
+   * Entradas:
    *
-   * [base],drawbox=...
-   *
-   * Isso fazia o FFmpeg retornar:
-   * No such filter: ''
+   * 0 = vídeo-base
+   * 1 = overlay PNG
+   * 2 = áudio, quando existir
    */
 
-  if (overlay.dark !== false) {
-    filterChain +=
-      `;[base]` +
-      `drawbox=` +
-      `x=0:` +
-      `y=0:` +
-      `w=iw:` +
-      `h=ih:` +
-      `color=black@0.34:` +
-      `t=fill,` +
-      `format=yuv420p[base2]`;
-  } else {
-    filterChain +=
-      `;[base]format=yuv420p[base2]`;
-  }
+  const overlayInputIndex = 1;
+  const audioInputIndex =
+    audioPath ? 2 : null;
 
-  let currentVideo = 'base2';
-
-  if (title) {
-    filterChain +=
-      `;[${currentVideo}]` +
-      `drawtext=` +
-      `font='Sans':` +
-      `textfile='${titleFile}':` +
-      `fontcolor=white:` +
-      `fontsize=72:` +
-      `line_spacing=14:` +
-      `x=(w-text_w)/2:` +
-      `y=${position}:` +
-      `shadowcolor=black@0.6:` +
-      `shadowx=3:` +
-      `shadowy=3[t1]`;
-
-    currentVideo = 't1';
-  }
-
-  if (body) {
-    const bodyY = title
-      ? `${position}+${Math.max(
-          150,
-          title.split('\n').length *
-            92
-        )}`
-      : position;
-
-    filterChain +=
-      `;[${currentVideo}]` +
-      `drawtext=` +
-      `font='Sans':` +
-      `textfile='${bodyFile}':` +
-      `fontcolor=white:` +
-      `fontsize=48:` +
-      `line_spacing=12:` +
-      `x=(w-text_w)/2:` +
-      `y=${bodyY}:` +
-      `shadowcolor=black@0.6:` +
-      `shadowx=2:` +
-      `shadowy=2[v]`;
-
-    currentVideo = 'v';
-  }
-
-  if (currentVideo !== 'v') {
-    filterChain +=
-      `;[${currentVideo}]null[v]`;
-  }
+  const filterChain =
+    buildVideoBaseFilter(
+      fitMode,
+      overlayInputIndex
+    );
 
   const args = [
     '-hide_banner',
@@ -507,6 +605,12 @@ async function renderVideoOverlay({
 
     '-i',
     videoPath,
+
+    '-loop',
+    '1',
+
+    '-i',
+    overlayPath,
   ];
 
   if (audioPath) {
@@ -527,7 +631,7 @@ async function renderVideoOverlay({
   if (audioPath) {
     args.push(
       '-map',
-      '1:a:0',
+      `${audioInputIndex}:a:0`,
 
       '-c:a',
       'aac',
@@ -560,11 +664,15 @@ async function renderVideoOverlay({
     '+faststart',
 
     '-t',
-    String(OUTPUT_DURATION)
+    String(
+      OUTPUT_DURATION
+    )
   );
 
   if (audioPath) {
-    args.push('-shortest');
+    args.push(
+      '-shortest'
+    );
   }
 
   args.push(
@@ -586,12 +694,19 @@ async function renderImageAudio({
   workdir,
   outputPath,
 }) {
-  const image = form.get('image');
-  const audio = form.get('audio');
+  const image =
+    form.get('image');
+
+  const audio =
+    form.get('audio');
 
   if (
-    !(image instanceof File) ||
-    !(audio instanceof File)
+    !(
+      image instanceof File
+    ) ||
+    !(
+      audio instanceof File
+    )
   ) {
     return Response.json(
       {
@@ -605,7 +720,8 @@ async function renderImageAudio({
   }
 
   if (
-    image.size + audio.size >
+    image.size +
+      audio.size >
     MAX_FORM_BYTES
   ) {
     return Response.json(
@@ -619,21 +735,23 @@ async function renderImageAudio({
     );
   }
 
-  const imagePath = path.join(
-    workdir,
-    `image${extFor(
-      image,
-      '.jpg'
-    )}`
-  );
+  const imagePath =
+    path.join(
+      workdir,
+      `image${extFor(
+        image,
+        '.jpg'
+      )}`
+    );
 
-  const audioPath = path.join(
-    workdir,
-    `audio${extFor(
-      audio,
-      '.mp3'
-    )}`
-  );
+  const audioPath =
+    path.join(
+      workdir,
+      `audio${extFor(
+        audio,
+        '.mp3'
+      )}`
+    );
 
   const preparedImagePath =
     path.join(
@@ -696,7 +814,9 @@ async function renderImageAudio({
       '1',
 
       '-framerate',
-      String(OUTPUT_FPS),
+      String(
+        OUTPUT_FPS
+      ),
 
       '-i',
       preparedImagePath,
@@ -717,7 +837,9 @@ async function renderImageAudio({
       '27',
 
       '-r',
-      String(OUTPUT_FPS),
+      String(
+        OUTPUT_FPS
+      ),
 
       '-c:a',
       'aac',
@@ -762,10 +884,11 @@ export async function POST(
     const form =
       await request.formData();
 
-    const mode = String(
-      form.get('mode') ||
-        'image_audio'
-    );
+    const mode =
+      String(
+        form.get('mode') ||
+          'image_audio'
+      );
 
     const outputPath =
       path.join(
@@ -773,10 +896,12 @@ export async function POST(
         'reel.mp4'
       );
 
-    let earlyResponse = null;
+    let earlyResponse =
+      null;
 
     if (
-      mode === 'video_overlay'
+      mode ===
+      'video_overlay'
     ) {
       earlyResponse =
         await renderVideoOverlay({
@@ -844,10 +969,13 @@ export async function POST(
             'no-store',
 
           'X-CP-Social-Renderer':
-            '1.1.1',
+            '1.2.0',
 
           'X-CP-Social-Resolution':
             `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`,
+
+          'X-CP-Social-Text-Engine':
+            'sharp-svg',
         },
       }
     );
