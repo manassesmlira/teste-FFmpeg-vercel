@@ -24,8 +24,13 @@ function extFor(file, fallback) {
   return ext && ext.length <= 6 ? ext : fallback;
 }
 
-function runFfmpeg(binary, args) {
+function runFfmpeg(binary, args, label = 'FFmpeg') {
   return new Promise((resolve, reject) => {
+    console.log(
+      `[CP Social ${label}]`,
+      JSON.stringify(args)
+    );
+
     const child = spawn(binary, args, {
       stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -35,8 +40,8 @@ function runFfmpeg(binary, args) {
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
 
-      if (stderr.length > 14000) {
-        stderr = stderr.slice(-14000);
+      if (stderr.length > 16000) {
+        stderr = stderr.slice(-16000);
       }
     });
 
@@ -44,13 +49,17 @@ function runFfmpeg(binary, args) {
 
     child.on('close', (code) => {
       if (code === 0) {
+        console.log(
+          `[CP Social ${label}] concluído`
+        );
+
         resolve();
         return;
       }
 
       reject(
         new Error(
-          `FFmpeg encerrou com código ${code}. ${stderr.slice(-4000)}`
+          `${label} falhou. FFmpeg encerrou com código ${code}. ${stderr.slice(-5000)}`
         )
       );
     });
@@ -209,6 +218,11 @@ async function downloadTo(raw, destination) {
 
   await fs.writeFile(destination, buffer);
 
+  console.log(
+    '[CP Social Download]',
+    `${destination}: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`
+  );
+
   return destination;
 }
 
@@ -273,12 +287,12 @@ function makeTextLines({
           x="${x}"
           y="${y}"
           text-anchor="middle"
-          font-family="Arial, Helvetica, sans-serif"
+          font-family="sans-serif"
           font-size="${fontSize}"
           font-weight="${fontWeight}"
           fill="#ffffff"
           stroke="#000000"
-          stroke-opacity="0.50"
+          stroke-opacity="0.45"
           stroke-width="2"
           paint-order="stroke fill"
         >${escapeXml(line)}</text>
@@ -339,9 +353,10 @@ async function createOverlayPng({
       300;
   } else {
     blockTop =
-      (OUTPUT_HEIGHT -
-        totalTextHeight) /
-      2;
+      (
+        OUTPUT_HEIGHT -
+        totalTextHeight
+      ) / 2;
   }
 
   const titleStartY =
@@ -406,51 +421,196 @@ async function createOverlayPng({
   )
     .png()
     .toFile(destination);
-}
 
-function buildVideoBaseFilter(
-  fitMode,
-  overlayInputIndex
-) {
-  let base;
+  const stat =
+    await fs.stat(destination);
 
-  if (fitMode === 'blur') {
-    base =
-      `[0:v]split=2[bgsrc][fgsrc];` +
-      `[bgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},` +
-      `boxblur=18:6[bg];` +
-      `[fgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg];` +
-      `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`;
-  } else if (
-    fitMode === 'contain'
-  ) {
-    base =
-      `[0:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
-      `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black[base]`;
-  } else {
-    base =
-      `[0:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}[base]`;
+  if (!stat.size) {
+    throw new Error(
+      'O overlay PNG foi criado vazio.'
+    );
   }
 
-  return (
-    `${base};` +
-    `[base][${overlayInputIndex}:v]` +
-    `overlay=0:0:format=auto,` +
-    `format=yuv420p[v]`
+  console.log(
+    '[CP Social Overlay PNG]',
+    `${stat.size} bytes`
   );
 }
 
-function buildImageBaseFilter() {
-  return (
-    `[0:v]split=2[bgsrc][fgsrc];` +
-    `[bgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,` +
-    `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},` +
-    `boxblur=18:6[bg];` +
-    `[fgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg];` +
-    `[bg][fg]overlay=(W-w)/2:(H-h)/2,` +
-    `format=yuv420p[out]`
+async function normalizeVideo({
+  ffmpeg,
+  videoPath,
+  normalizedVideoPath,
+}) {
+  /*
+   * Primeira etapa deliberadamente simples.
+   *
+   * O vídeo de fundo usado no CP Social deve ser 9:16.
+   * Aqui apenas convertemos para 1080x1920.
+   *
+   * Sem crop.
+   * Sem pad.
+   * Sem force_original_aspect_ratio.
+   * Sem filter_complex.
+   */
+
+  await runFfmpeg(
+    ffmpeg,
+    [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+
+      '-i',
+      videoPath,
+
+      '-vf',
+      `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}`,
+
+      '-c:v',
+      'libx264',
+
+      '-preset',
+      'ultrafast',
+
+      '-crf',
+      '29',
+
+      '-r',
+      String(OUTPUT_FPS),
+
+      '-pix_fmt',
+      'yuv420p',
+
+      '-an',
+
+      '-movflags',
+      '+faststart',
+
+      '-t',
+      String(OUTPUT_DURATION),
+
+      '-y',
+      normalizedVideoPath,
+    ],
+    'PASSO 1 - normalização'
+  );
+
+  const stat =
+    await fs.stat(
+      normalizedVideoPath
+    );
+
+  console.log(
+    '[CP Social Vídeo Normalizado]',
+    `${(stat.size / 1024 / 1024).toFixed(2)} MB`
+  );
+}
+
+async function applyOverlay({
+  ffmpeg,
+  normalizedVideoPath,
+  overlayPath,
+  audioPath,
+  outputPath,
+}) {
+  /*
+   * Entradas:
+   *
+   * 0 = vídeo já normalizado
+   * 1 = PNG transparente 1080x1920
+   * 2 = áudio opcional
+   */
+
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+
+    '-i',
+    normalizedVideoPath,
+
+    '-loop',
+    '1',
+
+    '-i',
+    overlayPath,
+  ];
+
+  if (audioPath) {
+    args.push(
+      '-i',
+      audioPath
+    );
+  }
+
+  const filter =
+    '[0:v][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[v]';
+
+  args.push(
+    '-filter_complex',
+    filter,
+
+    '-map',
+    '[v]'
+  );
+
+  if (audioPath) {
+    args.push(
+      '-map',
+      '2:a:0',
+
+      '-c:a',
+      'aac',
+
+      '-b:a',
+      '96k',
+
+      '-ar',
+      '44100',
+
+      '-shortest'
+    );
+  }
+
+  args.push(
+    '-c:v',
+    'libx264',
+
+    '-preset',
+    'ultrafast',
+
+    '-crf',
+    '29',
+
+    '-r',
+    String(OUTPUT_FPS),
+
+    '-pix_fmt',
+    'yuv420p',
+
+    '-movflags',
+    '+faststart',
+
+    '-t',
+    String(OUTPUT_DURATION),
+
+    '-y',
+    outputPath
+  );
+
+  await runFfmpeg(
+    ffmpeg,
+    args,
+    'PASSO 3 - overlay'
+  );
+
+  const stat =
+    await fs.stat(outputPath);
+
+  console.log(
+    '[CP Social Reel Final]',
+    `${(stat.size / 1024 / 1024).toFixed(2)} MB`
   );
 }
 
@@ -467,7 +627,8 @@ async function renderVideoOverlay({
   if (!videoUrl) {
     return Response.json(
       {
-        error: 'Informe video_url.',
+        error:
+          'Informe video_url.',
       },
       {
         status: 400,
@@ -475,10 +636,23 @@ async function renderVideoOverlay({
     );
   }
 
-  const videoPath = path.join(
-    workdir,
-    'video.mp4'
-  );
+  const videoPath =
+    path.join(
+      workdir,
+      'video-original.mp4'
+    );
+
+  const normalizedVideoPath =
+    path.join(
+      workdir,
+      'video-normalizado.mp4'
+    );
+
+  const overlayPath =
+    path.join(
+      workdir,
+      'overlay.png'
+    );
 
   await downloadTo(
     videoUrl,
@@ -497,7 +671,7 @@ async function renderVideoOverlay({
   if (audioUrl) {
     audioPath = path.join(
       workdir,
-      'audio-remote.mp3'
+      'audio-remoto.mp3'
     );
 
     await downloadTo(
@@ -526,7 +700,7 @@ async function renderVideoOverlay({
       workdir,
       `audio${extFor(
         audio,
-        '.webm'
+        '.mp3'
       )}`
     );
 
@@ -552,27 +726,25 @@ async function renderVideoOverlay({
     overlay = {};
   }
 
-  const requestedFitMode =
-    String(
-      form.get('fit_mode') ||
-        ''
-    );
+  /*
+   * PASSO 1
+   * Normaliza o vídeo.
+   */
 
-  const fitMode = [
-    'crop',
-    'blur',
-    'contain',
-  ].includes(
-    requestedFitMode
-  )
-    ? requestedFitMode
-    : 'crop';
+  await normalizeVideo({
+    ffmpeg,
+    videoPath,
+    normalizedVideoPath,
+  });
 
-  const overlayPath =
-    path.join(
-      workdir,
-      'overlay.png'
-    );
+  /*
+   * PASSO 2
+   * Sharp gera o PNG.
+   */
+
+  console.log(
+    '[CP Social PASSO 2] criando overlay PNG'
+  );
 
   await createOverlayPng({
     overlay,
@@ -580,112 +752,33 @@ async function renderVideoOverlay({
       overlayPath,
   });
 
+  console.log(
+    '[CP Social PASSO 2] overlay criado'
+  );
+
   /*
-   * Entradas:
-   *
-   * 0 = vídeo-base
-   * 1 = overlay PNG
-   * 2 = áudio, quando existir
+   * PASSO 3
+   * FFmpeg une vídeo + PNG + áudio.
    */
 
-  const overlayInputIndex = 1;
-  const audioInputIndex =
-    audioPath ? 2 : null;
-
-  const filterChain =
-    buildVideoBaseFilter(
-      fitMode,
-      overlayInputIndex
-    );
-
-  const args = [
-    '-hide_banner',
-    '-loglevel',
-    'error',
-
-    '-i',
-    videoPath,
-
-    '-loop',
-    '1',
-
-    '-i',
-    overlayPath,
-  ];
-
-  if (audioPath) {
-    args.push(
-      '-i',
-      audioPath
-    );
-  }
-
-  args.push(
-    '-filter_complex',
-    filterChain,
-
-    '-map',
-    '[v]'
-  );
-
-  if (audioPath) {
-    args.push(
-      '-map',
-      `${audioInputIndex}:a:0`,
-
-      '-c:a',
-      'aac',
-
-      '-b:a',
-      '96k',
-
-      '-ar',
-      '44100'
-    );
-  }
-
-  args.push(
-    '-c:v',
-    'libx264',
-
-    '-preset',
-    'ultrafast',
-
-    '-crf',
-    '29',
-
-    '-r',
-    String(OUTPUT_FPS),
-
-    '-pix_fmt',
-    'yuv420p',
-
-    '-movflags',
-    '+faststart',
-
-    '-t',
-    String(
-      OUTPUT_DURATION
-    )
-  );
-
-  if (audioPath) {
-    args.push(
-      '-shortest'
-    );
-  }
-
-  args.push(
-    '-y',
-    outputPath
-  );
-
-  await runFfmpeg(
+  await applyOverlay({
     ffmpeg,
-    args
-  );
+    normalizedVideoPath,
+    overlayPath,
+    audioPath,
+    outputPath,
+  });
 
   return null;
+}
+
+function buildImageBaseFilter() {
+  return (
+    `[0:v]split=2[bgsrc][fgsrc];` +
+    `[bgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},boxblur=18:6[bg];` +
+    `[fgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}[fg];` +
+    `[bg][fg]overlay=0:0,format=yuv420p[out]`
+  );
 }
 
 async function renderImageAudio({
@@ -701,12 +794,8 @@ async function renderImageAudio({
     form.get('audio');
 
   if (
-    !(
-      image instanceof File
-    ) ||
-    !(
-      audio instanceof File
-    )
+    !(image instanceof File) ||
+    !(audio instanceof File)
   ) {
     return Response.json(
       {
@@ -773,9 +862,6 @@ async function renderImageAudio({
     )
   );
 
-  const imageFilter =
-    buildImageBaseFilter();
-
   await runFfmpeg(
     ffmpeg,
     [
@@ -786,11 +872,8 @@ async function renderImageAudio({
       '-i',
       imagePath,
 
-      '-filter_complex',
-      imageFilter,
-
-      '-map',
-      '[out]',
+      '-vf',
+      `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}`,
 
       '-frames:v',
       '1',
@@ -800,7 +883,8 @@ async function renderImageAudio({
 
       '-y',
       preparedImagePath,
-    ]
+    ],
+    'imagem - preparação'
   );
 
   await runFfmpeg(
@@ -814,9 +898,7 @@ async function renderImageAudio({
       '1',
 
       '-framerate',
-      String(
-        OUTPUT_FPS
-      ),
+      String(OUTPUT_FPS),
 
       '-i',
       preparedImagePath,
@@ -837,9 +919,7 @@ async function renderImageAudio({
       '27',
 
       '-r',
-      String(
-        OUTPUT_FPS
-      ),
+      String(OUTPUT_FPS),
 
       '-c:a',
       'aac',
@@ -860,7 +940,8 @@ async function renderImageAudio({
 
       '-y',
       outputPath,
-    ]
+    ],
+    'imagem + áudio'
   );
 
   return null;
@@ -878,8 +959,17 @@ export async function POST(
     );
 
   try {
+    console.log(
+      '[CP Social Renderer] versão 1.2.1-debug'
+    );
+
     const ffmpeg =
       await resolveFfmpegPath();
+
+    console.log(
+      '[CP Social FFmpeg]',
+      ffmpeg
+    );
 
     const form =
       await request.formData();
@@ -889,6 +979,11 @@ export async function POST(
         form.get('mode') ||
           'image_audio'
       );
+
+    console.log(
+      '[CP Social Mode]',
+      mode
+    );
 
     const outputPath =
       path.join(
@@ -943,9 +1038,7 @@ export async function POST(
               output.byteLength /
               1024 /
               1024
-            ).toFixed(
-              2
-            )} MB`,
+            ).toFixed(2)} MB`,
         },
         {
           status: 507,
@@ -969,7 +1062,7 @@ export async function POST(
             'no-store',
 
           'X-CP-Social-Renderer':
-            '1.2.0',
+            '1.2.1-debug',
 
           'X-CP-Social-Resolution':
             `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`,
@@ -1001,10 +1094,13 @@ export async function POST(
     );
   } finally {
     await fs
-      .rm(workdir, {
-        recursive: true,
-        force: true,
-      })
+      .rm(
+        workdir,
+        {
+          recursive: true,
+          force: true,
+        }
+      )
       .catch(() => {});
   }
 }
