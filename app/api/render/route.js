@@ -19,6 +19,12 @@ const OUTPUT_HEIGHT = 1920;
 const OUTPUT_FPS = 24;
 const OUTPUT_DURATION = 30;
 
+// Compressão final
+const OUTPUT_VIDEO_BITRATE = '900k';
+const OUTPUT_VIDEO_MAXRATE = '1000k';
+const OUTPUT_VIDEO_BUFSIZE = '2000k';
+const OUTPUT_AUDIO_BITRATE = '64k';
+
 function extFor(file, fallback) {
   const ext = path.extname(file?.name || '').toLowerCase();
   return ext && ext.length <= 6 ? ext : fallback;
@@ -442,18 +448,6 @@ async function normalizeVideo({
   videoPath,
   normalizedVideoPath,
 }) {
-  /*
-   * Primeira etapa deliberadamente simples.
-   *
-   * O vídeo de fundo usado no CP Social deve ser 9:16.
-   * Aqui apenas convertemos para 1080x1920.
-   *
-   * Sem crop.
-   * Sem pad.
-   * Sem force_original_aspect_ratio.
-   * Sem filter_complex.
-   */
-
   await runFfmpeg(
     ffmpeg,
     [
@@ -474,7 +468,7 @@ async function normalizeVideo({
       'ultrafast',
 
       '-crf',
-      '29',
+      '31',
 
       '-r',
       String(OUTPUT_FPS),
@@ -514,14 +508,6 @@ async function applyOverlay({
   audioPath,
   outputPath,
 }) {
-  /*
-   * Entradas:
-   *
-   * 0 = vídeo já normalizado
-   * 1 = PNG transparente 1080x1920
-   * 2 = áudio opcional
-   */
-
   const args = [
     '-hide_banner',
     '-loglevel',
@@ -564,24 +550,34 @@ async function applyOverlay({
       'aac',
 
       '-b:a',
-      '96k',
+      OUTPUT_AUDIO_BITRATE,
 
       '-ar',
-      '44100',
-
-      '-shortest'
+      '44100'
     );
   }
+
+  /*
+   * Aqui está a principal mudança:
+   * bitrate controlado para manter o vídeo final
+   * abaixo do limite da Vercel.
+   */
 
   args.push(
     '-c:v',
     'libx264',
 
     '-preset',
-    'ultrafast',
+    'veryfast',
 
-    '-crf',
-    '29',
+    '-b:v',
+    OUTPUT_VIDEO_BITRATE,
+
+    '-maxrate',
+    OUTPUT_VIDEO_MAXRATE,
+
+    '-bufsize',
+    OUTPUT_VIDEO_BUFSIZE,
 
     '-r',
     String(OUTPUT_FPS),
@@ -593,8 +589,14 @@ async function applyOverlay({
     '+faststart',
 
     '-t',
-    String(OUTPUT_DURATION),
+    String(OUTPUT_DURATION)
+  );
 
+  if (audioPath) {
+    args.push('-shortest');
+  }
+
+  args.push(
     '-y',
     outputPath
   );
@@ -602,7 +604,7 @@ async function applyOverlay({
   await runFfmpeg(
     ffmpeg,
     args,
-    'PASSO 3 - overlay'
+    'PASSO 3 - overlay + compressão'
   );
 
   const stat =
@@ -726,21 +728,15 @@ async function renderVideoOverlay({
     overlay = {};
   }
 
-  /*
-   * PASSO 1
-   * Normaliza o vídeo.
-   */
+  console.log(
+    '[CP Social PASSO 1] normalizando vídeo'
+  );
 
   await normalizeVideo({
     ffmpeg,
     videoPath,
     normalizedVideoPath,
   });
-
-  /*
-   * PASSO 2
-   * Sharp gera o PNG.
-   */
 
   console.log(
     '[CP Social PASSO 2] criando overlay PNG'
@@ -756,10 +752,9 @@ async function renderVideoOverlay({
     '[CP Social PASSO 2] overlay criado'
   );
 
-  /*
-   * PASSO 3
-   * FFmpeg une vídeo + PNG + áudio.
-   */
+  console.log(
+    '[CP Social PASSO 3] aplicando overlay e comprimindo'
+  );
 
   await applyOverlay({
     ffmpeg,
@@ -770,15 +765,6 @@ async function renderVideoOverlay({
   });
 
   return null;
-}
-
-function buildImageBaseFilter() {
-  return (
-    `[0:v]split=2[bgsrc][fgsrc];` +
-    `[bgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},boxblur=18:6[bg];` +
-    `[fgsrc]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}[fg];` +
-    `[bg][fg]overlay=0:0,format=yuv420p[out]`
-  );
 }
 
 async function renderImageAudio({
@@ -910,13 +896,16 @@ async function renderImageAudio({
       'libx264',
 
       '-preset',
-      'ultrafast',
+      'veryfast',
 
-      '-tune',
-      'stillimage',
+      '-b:v',
+      OUTPUT_VIDEO_BITRATE,
 
-      '-crf',
-      '27',
+      '-maxrate',
+      OUTPUT_VIDEO_MAXRATE,
+
+      '-bufsize',
+      OUTPUT_VIDEO_BUFSIZE,
 
       '-r',
       String(OUTPUT_FPS),
@@ -925,7 +914,7 @@ async function renderImageAudio({
       'aac',
 
       '-b:a',
-      '96k',
+      OUTPUT_AUDIO_BITRATE,
 
       '-ar',
       '44100',
@@ -960,7 +949,7 @@ export async function POST(
 
   try {
     console.log(
-      '[CP Social Renderer] versão 1.2.1-debug'
+      '[CP Social Renderer] versão 1.2.2-compressed'
     );
 
     const ffmpeg =
@@ -1024,6 +1013,15 @@ export async function POST(
         outputPath
       );
 
+    console.log(
+      '[CP Social Saída Final]',
+      `${(
+        output.byteLength /
+        1024 /
+        1024
+      ).toFixed(2)} MB`
+    );
+
     if (
       output.byteLength >
       MAX_OUTPUT_BYTES
@@ -1062,7 +1060,7 @@ export async function POST(
             'no-store',
 
           'X-CP-Social-Renderer':
-            '1.2.1-debug',
+            '1.2.2-compressed',
 
           'X-CP-Social-Resolution':
             `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`,
