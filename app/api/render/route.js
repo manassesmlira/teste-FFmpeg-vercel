@@ -17,70 +17,291 @@ const MAX_OUTPUT_BYTES = 4.3 * 1024 * 1024;
 const OUTPUT_WIDTH = 1080;
 const OUTPUT_HEIGHT = 1920;
 const OUTPUT_FPS = 24;
-const OUTPUT_DURATION = 30;
 
-// Compressão final
-const OUTPUT_VIDEO_BITRATE = '900k';
-const OUTPUT_VIDEO_MAXRATE = '1000k';
-const OUTPUT_VIDEO_BUFSIZE = '2000k';
+// A mensagem é o áudio.
+// O Reel acompanha a duração do áudio até o máximo de 90 segundos.
+const MAX_OUTPUT_DURATION = 90;
+
+// Mantemos margem para não ultrapassar o limite
+// de resposta da Function da Vercel.
 const OUTPUT_AUDIO_BITRATE = '64k';
+const TARGET_OUTPUT_BYTES = 4.0 * 1024 * 1024;
 
 function extFor(file, fallback) {
   const ext = path.extname(file?.name || '').toLowerCase();
-  return ext && ext.length <= 6 ? ext : fallback;
+
+  return ext && ext.length <= 6
+    ? ext
+    : fallback;
 }
 
-function runFfmpeg(binary, args, label = 'FFmpeg') {
+function runFfmpeg(
+  binary,
+  args,
+  label = 'FFmpeg'
+) {
   return new Promise((resolve, reject) => {
     console.log(
       `[CP Social ${label}]`,
       JSON.stringify(args)
     );
 
-    const child = spawn(binary, args, {
-      stdio: ['ignore', 'ignore', 'pipe'],
-    });
+    const child = spawn(
+      binary,
+      args,
+      {
+        stdio: [
+          'ignore',
+          'ignore',
+          'pipe',
+        ],
+      }
+    );
 
     let stderr = '';
 
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
+    child.stderr.on(
+      'data',
+      (chunk) => {
+        stderr += chunk.toString();
 
-      if (stderr.length > 16000) {
-        stderr = stderr.slice(-16000);
+        if (stderr.length > 16000) {
+          stderr =
+            stderr.slice(-16000);
+        }
       }
-    });
+    );
 
-    child.on('error', reject);
+    child.on(
+      'error',
+      reject
+    );
 
-    child.on('close', (code) => {
-      if (code === 0) {
-        console.log(
-          `[CP Social ${label}] concluído`
+    child.on(
+      'close',
+      (code) => {
+        if (code === 0) {
+          console.log(
+            `[CP Social ${label}] concluído`
+          );
+
+          resolve();
+          return;
+        }
+
+        reject(
+          new Error(
+            `${label} falhou. FFmpeg encerrou com código ${code}. ${stderr.slice(-5000)}`
+          )
         );
-
-        resolve();
-        return;
       }
-
-      reject(
-        new Error(
-          `${label} falhou. FFmpeg encerrou com código ${code}. ${stderr.slice(-5000)}`
-        )
-      );
-    });
+    );
   });
 }
+
+
+/*
+ * Descobre a duração real de um arquivo
+ * usando o próprio FFmpeg.
+ *
+ * Não dependemos de ffprobe separado,
+ * porque ffmpeg-static já está disponível.
+ */
+async function probeMediaDuration(
+  binary,
+  filePath
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const child = spawn(
+        binary,
+        [
+          '-hide_banner',
+          '-i',
+          filePath,
+        ],
+        {
+          stdio: [
+            'ignore',
+            'ignore',
+            'pipe',
+          ],
+        }
+      );
+
+      let stderr = '';
+
+      child.stderr.on(
+        'data',
+        (chunk) => {
+          stderr +=
+            chunk.toString();
+
+          if (
+            stderr.length >
+            32000
+          ) {
+            stderr =
+              stderr.slice(
+                -32000
+              );
+          }
+        }
+      );
+
+      child.on(
+        'error',
+        reject
+      );
+
+      child.on(
+        'close',
+        () => {
+          const match =
+            stderr.match(
+              /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/
+            );
+
+          if (!match) {
+            reject(
+              new Error(
+                `Não foi possível identificar a duração da mídia: ${filePath}`
+              )
+            );
+
+            return;
+          }
+
+          const hours =
+            Number(match[1]);
+
+          const minutes =
+            Number(match[2]);
+
+          const seconds =
+            Number(match[3]);
+
+          const duration =
+            hours * 3600 +
+            minutes * 60 +
+            seconds;
+
+          if (
+            !Number.isFinite(
+              duration
+            ) ||
+            duration <= 0
+          ) {
+            reject(
+              new Error(
+                `Duração de mídia inválida: ${filePath}`
+              )
+            );
+
+            return;
+          }
+
+          resolve(duration);
+        }
+      );
+    }
+  );
+}
+
+
+/*
+ * Limite operacional do CP Social:
+ *
+ * mínimo: 0,5 segundo
+ * máximo: 90 segundos
+ */
+function clampDuration(duration) {
+  return Math.min(
+    MAX_OUTPUT_DURATION,
+    Math.max(
+      0.5,
+      duration
+    )
+  );
+}
+
+
+/*
+ * Calcula automaticamente o bitrate
+ * para tentar manter o MP4 final abaixo
+ * do limite de resposta da Vercel.
+ *
+ * Vídeos curtos:
+ * maior qualidade.
+ *
+ * Vídeos longos:
+ * compressão maior.
+ */
+function bitrateForDuration(
+  duration,
+  hasAudio = true
+) {
+  const safeBits =
+    TARGET_OUTPUT_BYTES *
+    8 *
+    0.90;
+
+  const totalBps =
+    safeBits /
+    Math.max(
+      duration,
+      1
+    );
+
+  const audioBps =
+    hasAudio
+      ? 64 * 1000
+      : 0;
+
+  const videoBps =
+    Math.max(
+      220 * 1000,
+      Math.min(
+        900 * 1000,
+        totalBps -
+          audioBps
+      )
+    );
+
+  const kbps =
+    Math.floor(
+      videoBps /
+      1000
+    );
+
+  return {
+    bitrate:
+      `${kbps}k`,
+
+    maxrate:
+      `${Math.floor(
+        kbps * 1.12
+      )}k`,
+
+    bufsize:
+      `${Math.floor(
+        kbps * 2
+      )}k`,
+  };
+}
+
 
 async function resolveFfmpegPath() {
   const candidates = [
     ffmpegStaticPath,
+
     path.join(
       process.cwd(),
       'node_modules',
       'ffmpeg-static',
       'ffmpeg'
     ),
+
     path.join(
       process.cwd(),
       'node_modules',
@@ -89,24 +310,45 @@ async function resolveFfmpegPath() {
     ),
   ].filter(Boolean);
 
-  for (const candidate of candidates) {
+  for (
+    const candidate
+    of candidates
+  ) {
     try {
-      await fs.access(candidate, fsConstants.X_OK);
+      await fs.access(
+        candidate,
+        fsConstants.X_OK
+      );
+
       return candidate;
     } catch {}
   }
 
-  for (const candidate of candidates) {
+  for (
+    const candidate
+    of candidates
+  ) {
     try {
-      await fs.access(candidate, fsConstants.F_OK);
-
-      const tempPath = path.join(
-        os.tmpdir(),
-        'cp-social-ffmpeg'
+      await fs.access(
+        candidate,
+        fsConstants.F_OK
       );
 
-      await fs.copyFile(candidate, tempPath);
-      await fs.chmod(tempPath, 0o755);
+      const tempPath =
+        path.join(
+          os.tmpdir(),
+          'cp-social-ffmpeg'
+        );
+
+      await fs.copyFile(
+        candidate,
+        tempPath
+      );
+
+      await fs.chmod(
+        tempPath,
+        0o755
+      );
 
       return tempPath;
     } catch {}
@@ -116,6 +358,7 @@ async function resolveFfmpegPath() {
     `FFmpeg não encontrado: ${candidates.join(' | ')}`
   );
 }
+
 
 function isPrivateIp(ip) {
   if (
@@ -131,10 +374,14 @@ function isPrivateIp(ip) {
     return true;
   }
 
-  const match = ip.match(/^172\.(\d+)\./);
+  const match =
+    ip.match(
+      /^172\.(\d+)\./
+    );
 
   if (match) {
-    const secondOctet = Number(match[1]);
+    const secondOctet =
+      Number(match[1]);
 
     return (
       secondOctet >= 16 &&
@@ -145,30 +392,53 @@ function isPrivateIp(ip) {
   return false;
 }
 
+
 async function assertPublicUrl(raw) {
   let url;
 
   try {
-    url = new URL(raw);
+    url =
+      new URL(raw);
   } catch {
-    throw new Error('URL remota inválida.');
-  }
-
-  if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new Error('URL remota inválida.');
+    throw new Error(
+      'URL remota inválida.'
+    );
   }
 
   if (
-    ['localhost', '127.0.0.1', '::1'].includes(
+    ![
+      'http:',
+      'https:',
+    ].includes(
+      url.protocol
+    )
+  ) {
+    throw new Error(
+      'URL remota inválida.'
+    );
+  }
+
+  if (
+    [
+      'localhost',
+      '127.0.0.1',
+      '::1',
+    ].includes(
       url.hostname
     )
   ) {
-    throw new Error('Host remoto não permitido.');
+    throw new Error(
+      'Host remoto não permitido.'
+    );
   }
 
-  const results = await dns.lookup(url.hostname, {
-    all: true,
-  });
+  const results =
+    await dns.lookup(
+      url.hostname,
+      {
+        all: true,
+      }
+    );
 
   if (!results.length) {
     throw new Error(
@@ -177,8 +447,11 @@ async function assertPublicUrl(raw) {
   }
 
   if (
-    results.some((result) =>
-      isPrivateIp(result.address)
+    results.some(
+      (result) =>
+        isPrivateIp(
+          result.address
+        )
     )
   ) {
     throw new Error(
@@ -189,12 +462,24 @@ async function assertPublicUrl(raw) {
   return url;
 }
 
-async function downloadTo(raw, destination) {
-  const url = await assertPublicUrl(raw);
 
-  const response = await fetch(url, {
-    redirect: 'follow',
-  });
+async function downloadTo(
+  raw,
+  destination
+) {
+  const url =
+    await assertPublicUrl(
+      raw
+    );
+
+  const response =
+    await fetch(
+      url,
+      {
+        redirect:
+          'follow',
+      }
+    );
 
   if (!response.ok) {
     throw new Error(
@@ -202,27 +487,40 @@ async function downloadTo(raw, destination) {
     );
   }
 
-  const contentLength = Number(
-    response.headers.get('content-length') || 0
-  );
+  const contentLength =
+    Number(
+      response.headers.get(
+        'content-length'
+      ) || 0
+    );
 
-  if (contentLength > MAX_REMOTE_BYTES) {
+  if (
+    contentLength >
+    MAX_REMOTE_BYTES
+  ) {
     throw new Error(
       'Mídia remota excede 30 MB. Comprima o arquivo antes de renderizar.'
     );
   }
 
-  const buffer = Buffer.from(
-    await response.arrayBuffer()
-  );
+  const buffer =
+    Buffer.from(
+      await response.arrayBuffer()
+    );
 
-  if (buffer.length > MAX_REMOTE_BYTES) {
+  if (
+    buffer.length >
+    MAX_REMOTE_BYTES
+  ) {
     throw new Error(
       'Mídia remota excede 30 MB. Comprima o arquivo antes de renderizar.'
     );
   }
 
-  await fs.writeFile(destination, buffer);
+  await fs.writeFile(
+    destination,
+    buffer
+  );
 
   console.log(
     '[CP Social Download]',
@@ -232,32 +530,65 @@ async function downloadTo(raw, destination) {
   return destination;
 }
 
+
 function escapeXml(value) {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+  return String(
+    value || ''
+  )
+    .replace(
+      /&/g,
+      '&amp;'
+    )
+    .replace(
+      /</g,
+      '&lt;'
+    )
+    .replace(
+      />/g,
+      '&gt;'
+    )
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+    .replace(
+      /'/g,
+      '&apos;'
+    );
 }
 
-function wrapText(text, maxCharacters) {
-  const words = String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
+
+function wrapText(
+  text,
+  maxCharacters
+) {
+  const words =
+    String(
+      text || ''
+    )
+      .replace(
+        /\s+/g,
+        ' '
+      )
+      .trim()
+      .split(' ')
+      .filter(Boolean);
 
   const lines = [];
   let line = '';
 
-  for (const word of words) {
-    const candidate = line
-      ? `${line} ${word}`
-      : word;
+  for (
+    const word
+    of words
+  ) {
+    const candidate =
+      line
+        ? `${line} ${word}`
+        : word;
 
     if (
-      candidate.length > maxCharacters &&
+      candidate.length >
+        maxCharacters &&
       line
     ) {
       lines.push(line);
@@ -274,6 +605,7 @@ function wrapText(text, maxCharacters) {
   return lines;
 }
 
+
 function makeTextLines({
   lines,
   x,
@@ -283,49 +615,72 @@ function makeTextLines({
   fontWeight,
 }) {
   return lines
-    .map((line, index) => {
-      const y =
-        startY +
-        index * lineHeight;
+    .map(
+      (
+        line,
+        index
+      ) => {
+        const y =
+          startY +
+          index *
+            lineHeight;
 
-      return `
-        <text
-          x="${x}"
-          y="${y}"
-          text-anchor="middle"
-          font-family="sans-serif"
-          font-size="${fontSize}"
-          font-weight="${fontWeight}"
-          fill="#ffffff"
-          stroke="#000000"
-          stroke-opacity="0.45"
-          stroke-width="2"
-          paint-order="stroke fill"
-        >${escapeXml(line)}</text>
-      `;
-    })
+        return `
+          <text
+            x="${x}"
+            y="${y}"
+            text-anchor="middle"
+            font-family="sans-serif"
+            font-size="${fontSize}"
+            font-weight="${fontWeight}"
+            fill="#ffffff"
+            stroke="#000000"
+            stroke-opacity="0.45"
+            stroke-width="2"
+            paint-order="stroke fill"
+          >${escapeXml(line)}</text>
+        `;
+      }
+    )
     .join('');
 }
+
 
 async function createOverlayPng({
   overlay,
   destination,
 }) {
-  const titleLines = wrapText(
-    overlay.title || '',
-    24
-  );
+  const titleLines =
+    wrapText(
+      overlay.title ||
+        '',
+      24
+    );
 
-  const bodyLines = wrapText(
-    overlay.text || '',
-    34
-  );
+  /*
+   * CP Social atual usa body.
+   * Mantemos text para compatibilidade
+   * com JSONs antigos.
+   */
+  const bodyLines =
+    wrapText(
+      overlay.body ||
+        overlay.text ||
+        '',
+      34
+    );
 
-  const titleFontSize = 72;
-  const titleLineHeight = 88;
+  const titleFontSize =
+    72;
 
-  const bodyFontSize = 48;
-  const bodyLineHeight = 64;
+  const titleLineHeight =
+    88;
+
+  const bodyFontSize =
+    48;
+
+  const bodyLineHeight =
+    64;
 
   const titleHeight =
     titleLines.length *
@@ -348,10 +703,14 @@ async function createOverlayPng({
 
   let blockTop;
 
-  if (overlay.position === 'top') {
+  if (
+    overlay.position ===
+    'top'
+  ) {
     blockTop = 250;
   } else if (
-    overlay.position === 'bottom'
+    overlay.position ===
+    'bottom'
   ) {
     blockTop =
       OUTPUT_HEIGHT -
@@ -391,22 +750,46 @@ async function createOverlayPng({
 
   const titleSvg =
     makeTextLines({
-      lines: titleLines,
-      x: OUTPUT_WIDTH / 2,
-      startY: titleStartY,
-      fontSize: titleFontSize,
-      lineHeight: titleLineHeight,
-      fontWeight: 700,
+      lines:
+        titleLines,
+
+      x:
+        OUTPUT_WIDTH /
+        2,
+
+      startY:
+        titleStartY,
+
+      fontSize:
+        titleFontSize,
+
+      lineHeight:
+        titleLineHeight,
+
+      fontWeight:
+        700,
     });
 
   const bodySvg =
     makeTextLines({
-      lines: bodyLines,
-      x: OUTPUT_WIDTH / 2,
-      startY: bodyStartY,
-      fontSize: bodyFontSize,
-      lineHeight: bodyLineHeight,
-      fontWeight: 500,
+      lines:
+        bodyLines,
+
+      x:
+        OUTPUT_WIDTH /
+        2,
+
+      startY:
+        bodyStartY,
+
+      fontSize:
+        bodyFontSize,
+
+      lineHeight:
+        bodyLineHeight,
+
+      fontWeight:
+        500,
     });
 
   const svg = `
@@ -426,10 +809,14 @@ async function createOverlayPng({
     Buffer.from(svg)
   )
     .png()
-    .toFile(destination);
+    .toFile(
+      destination
+    );
 
   const stat =
-    await fs.stat(destination);
+    await fs.stat(
+      destination
+    );
 
   if (!stat.size) {
     throw new Error(
@@ -443,50 +830,78 @@ async function createOverlayPng({
   );
 }
 
+
+/*
+ * Prepara o vídeo-base.
+ *
+ * Se o áudio for maior que o vídeo,
+ * stream_loop repete o vídeo.
+ *
+ * Se o vídeo for maior que o áudio,
+ * -t encerra exatamente na duração
+ * determinada pela narração.
+ */
 async function normalizeVideo({
   ffmpeg,
   videoPath,
   normalizedVideoPath,
+  duration,
+  loopVideo = false,
 }) {
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+  ];
+
+  if (loopVideo) {
+    args.push(
+      '-stream_loop',
+      '-1'
+    );
+  }
+
+  args.push(
+    '-i',
+    videoPath,
+
+    '-vf',
+    `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}`,
+
+    '-c:v',
+    'libx264',
+
+    '-preset',
+    'ultrafast',
+
+    '-crf',
+    '31',
+
+    '-r',
+    String(
+      OUTPUT_FPS
+    ),
+
+    '-pix_fmt',
+    'yuv420p',
+
+    '-an',
+
+    '-movflags',
+    '+faststart',
+
+    '-t',
+    String(
+      duration
+    ),
+
+    '-y',
+    normalizedVideoPath
+  );
+
   await runFfmpeg(
     ffmpeg,
-    [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-
-      '-i',
-      videoPath,
-
-      '-vf',
-      `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}`,
-
-      '-c:v',
-      'libx264',
-
-      '-preset',
-      'ultrafast',
-
-      '-crf',
-      '31',
-
-      '-r',
-      String(OUTPUT_FPS),
-
-      '-pix_fmt',
-      'yuv420p',
-
-      '-an',
-
-      '-movflags',
-      '+faststart',
-
-      '-t',
-      String(OUTPUT_DURATION),
-
-      '-y',
-      normalizedVideoPath,
-    ],
+    args,
     'PASSO 1 - normalização'
   );
 
@@ -497,17 +912,35 @@ async function normalizeVideo({
 
   console.log(
     '[CP Social Vídeo Normalizado]',
-    `${(stat.size / 1024 / 1024).toFixed(2)} MB`
+    `${(stat.size / 1024 / 1024).toFixed(2)} MB`,
+    `duração-alvo=${duration}s`,
+    loopVideo
+      ? 'loop=sim'
+      : 'loop=não'
   );
 }
 
+
+/*
+ * Aplica a camada de texto e o áudio
+ * sobre o vídeo normalizado.
+ */
 async function applyOverlay({
   ffmpeg,
   normalizedVideoPath,
   overlayPath,
   audioPath,
   outputPath,
+  duration,
 }) {
+  const videoRate =
+    bitrateForDuration(
+      duration,
+      Boolean(
+        audioPath
+      )
+    );
+
   const args = [
     '-hide_banner',
     '-loglevel',
@@ -516,6 +949,10 @@ async function applyOverlay({
     '-i',
     normalizedVideoPath,
 
+    /*
+     * O PNG do texto precisa permanecer
+     * durante todo o vídeo.
+     */
     '-loop',
     '1',
 
@@ -557,12 +994,6 @@ async function applyOverlay({
     );
   }
 
-  /*
-   * Aqui está a principal mudança:
-   * bitrate controlado para manter o vídeo final
-   * abaixo do limite da Vercel.
-   */
-
   args.push(
     '-c:v',
     'libx264',
@@ -571,16 +1002,18 @@ async function applyOverlay({
     'veryfast',
 
     '-b:v',
-    OUTPUT_VIDEO_BITRATE,
+    videoRate.bitrate,
 
     '-maxrate',
-    OUTPUT_VIDEO_MAXRATE,
+    videoRate.maxrate,
 
     '-bufsize',
-    OUTPUT_VIDEO_BUFSIZE,
+    videoRate.bufsize,
 
     '-r',
-    String(OUTPUT_FPS),
+    String(
+      OUTPUT_FPS
+    ),
 
     '-pix_fmt',
     'yuv420p',
@@ -588,12 +1021,20 @@ async function applyOverlay({
     '-movflags',
     '+faststart',
 
+    /*
+     * A duração já foi determinada
+     * pelo áudio no passo anterior.
+     */
     '-t',
-    String(OUTPUT_DURATION)
+    String(
+      duration
+    )
   );
 
   if (audioPath) {
-    args.push('-shortest');
+    args.push(
+      '-shortest'
+    );
   }
 
   args.push(
@@ -608,23 +1049,35 @@ async function applyOverlay({
   );
 
   const stat =
-    await fs.stat(outputPath);
+    await fs.stat(
+      outputPath
+    );
 
   console.log(
     '[CP Social Reel Final]',
-    `${(stat.size / 1024 / 1024).toFixed(2)} MB`
+    `${(stat.size / 1024 / 1024).toFixed(2)} MB`,
+    `bitrate=${videoRate.bitrate}`,
+    `duração=${duration}s`
   );
 }
 
+
+/*
+ * MODO:
+ * vídeo-base + áudio + texto
+ */
 async function renderVideoOverlay({
   ffmpeg,
   form,
   workdir,
   outputPath,
 }) {
-  const videoUrl = String(
-    form.get('video_url') || ''
-  ).trim();
+  const videoUrl =
+    String(
+      form.get(
+        'video_url'
+      ) || ''
+    ).trim();
 
   if (!videoUrl) {
     return Response.json(
@@ -663,18 +1116,22 @@ async function renderVideoOverlay({
 
   let audioPath = '';
 
-  const audioUrl = String(
-    form.get('audio_url') || ''
-  ).trim();
+  const audioUrl =
+    String(
+      form.get(
+        'audio_url'
+      ) || ''
+    ).trim();
 
   const audio =
     form.get('audio');
 
   if (audioUrl) {
-    audioPath = path.join(
-      workdir,
-      'audio-remoto.mp3'
-    );
+    audioPath =
+      path.join(
+        workdir,
+        'audio-remoto.mp3'
+      );
 
     await downloadTo(
       audioUrl,
@@ -698,13 +1155,14 @@ async function renderVideoOverlay({
       );
     }
 
-    audioPath = path.join(
-      workdir,
-      `audio${extFor(
-        audio,
-        '.mp3'
-      )}`
-    );
+    audioPath =
+      path.join(
+        workdir,
+        `audio${extFor(
+          audio,
+          '.mp3'
+        )}`
+      );
 
     await fs.writeFile(
       audioPath,
@@ -714,14 +1172,86 @@ async function renderVideoOverlay({
     );
   }
 
+  /*
+   * Primeiro descobrimos quanto dura
+   * o vídeo original.
+   */
+  const sourceVideoDuration =
+    await probeMediaDuration(
+      ffmpeg,
+      videoPath
+    );
+
+  /*
+   * Se houver áudio, ele é a mensagem
+   * e portanto manda na duração.
+   */
+  const audioDuration =
+    audioPath
+      ? await probeMediaDuration(
+          ffmpeg,
+          audioPath
+        )
+      : 0;
+
+  /*
+   * REGRA PRINCIPAL:
+   *
+   * áudio de 20 s = Reel de 20 s
+   * áudio de 61 s = Reel de 61 s
+   * áudio de 89 s = Reel de 89 s
+   * áudio de 100 s = Reel de 90 s
+   *
+   * Sem áudio:
+   * usa a duração do vídeo,
+   * limitada também a 90 s.
+   */
+  const targetDuration =
+    clampDuration(
+      audioDuration ||
+      sourceVideoDuration
+    );
+
+  /*
+   * Se a narração durar mais que o
+   * vídeo-base, repetimos o vídeo.
+   */
+  const loopVideo =
+    Boolean(audioPath) &&
+    sourceVideoDuration <
+      targetDuration -
+      0.05;
+
+  console.log(
+    '[CP Social Duração]',
+    JSON.stringify({
+      video:
+        sourceVideoDuration,
+
+      audio:
+        audioDuration ||
+        null,
+
+      final:
+        targetDuration,
+
+      limite:
+        MAX_OUTPUT_DURATION,
+
+      loopVideo,
+    })
+  );
+
   let overlay = {};
 
   try {
     overlay =
       JSON.parse(
         String(
-          form.get('overlay') ||
-            '{}'
+          form.get(
+            'overlay'
+          ) ||
+          '{}'
         )
       ) || {};
   } catch {
@@ -736,6 +1266,11 @@ async function renderVideoOverlay({
     ffmpeg,
     videoPath,
     normalizedVideoPath,
+
+    duration:
+      targetDuration,
+
+    loopVideo,
   });
 
   console.log(
@@ -744,6 +1279,7 @@ async function renderVideoOverlay({
 
   await createOverlayPng({
     overlay,
+
     destination:
       overlayPath,
   });
@@ -762,11 +1298,22 @@ async function renderVideoOverlay({
     overlayPath,
     audioPath,
     outputPath,
+
+    duration:
+      targetDuration,
   });
 
   return null;
 }
 
+
+/*
+ * MODO:
+ * imagem estática + áudio
+ *
+ * Aqui também o áudio manda
+ * na duração.
+ */
 async function renderImageAudio({
   ffmpeg,
   form,
@@ -848,6 +1395,49 @@ async function renderImageAudio({
     )
   );
 
+  /*
+   * A duração do áudio define
+   * a duração da imagem transformada
+   * em vídeo.
+   */
+  const audioDuration =
+    await probeMediaDuration(
+      ffmpeg,
+      audioPath
+    );
+
+  const targetDuration =
+    clampDuration(
+      audioDuration
+    );
+
+  const videoRate =
+    bitrateForDuration(
+      targetDuration,
+      true
+    );
+
+  console.log(
+    '[CP Social Duração imagem+áudio]',
+    JSON.stringify({
+      audio:
+        audioDuration,
+
+      final:
+        targetDuration,
+
+      limite:
+        MAX_OUTPUT_DURATION,
+
+      bitrate:
+        videoRate.bitrate,
+    })
+  );
+
+  /*
+   * Primeiro transforma a imagem
+   * em um JPG vertical preparado.
+   */
   await runFfmpeg(
     ffmpeg,
     [
@@ -870,9 +1460,14 @@ async function renderImageAudio({
       '-y',
       preparedImagePath,
     ],
+
     'imagem - preparação'
   );
 
+  /*
+   * Depois mantém essa imagem
+   * durante toda a narração.
+   */
   await runFfmpeg(
     ffmpeg,
     [
@@ -884,7 +1479,9 @@ async function renderImageAudio({
       '1',
 
       '-framerate',
-      String(OUTPUT_FPS),
+      String(
+        OUTPUT_FPS
+      ),
 
       '-i',
       preparedImagePath,
@@ -899,16 +1496,18 @@ async function renderImageAudio({
       'veryfast',
 
       '-b:v',
-      OUTPUT_VIDEO_BITRATE,
+      videoRate.bitrate,
 
       '-maxrate',
-      OUTPUT_VIDEO_MAXRATE,
+      videoRate.maxrate,
 
       '-bufsize',
-      OUTPUT_VIDEO_BUFSIZE,
+      videoRate.bufsize,
 
       '-r',
-      String(OUTPUT_FPS),
+      String(
+        OUTPUT_FPS
+      ),
 
       '-c:a',
       'aac',
@@ -925,16 +1524,23 @@ async function renderImageAudio({
       '-movflags',
       '+faststart',
 
+      '-t',
+      String(
+        targetDuration
+      ),
+
       '-shortest',
 
       '-y',
       outputPath,
     ],
+
     'imagem + áudio'
   );
 
   return null;
 }
+
 
 export async function POST(
   request
@@ -949,7 +1555,7 @@ export async function POST(
 
   try {
     console.log(
-      '[CP Social Renderer] versão 1.2.2-compressed'
+      '[CP Social Renderer] versão 1.2.3-audio-duration-90s'
     );
 
     const ffmpeg =
@@ -965,8 +1571,10 @@ export async function POST(
 
     const mode =
       String(
-        form.get('mode') ||
-          'image_audio'
+        form.get(
+          'mode'
+        ) ||
+        'image_audio'
       );
 
     console.log(
@@ -1022,6 +1630,11 @@ export async function POST(
       ).toFixed(2)} MB`
     );
 
+    /*
+     * Segurança final:
+     * nunca devolve um arquivo acima
+     * do limite operacional definido.
+     */
     if (
       output.byteLength >
       MAX_OUTPUT_BYTES
@@ -1060,13 +1673,18 @@ export async function POST(
             'no-store',
 
           'X-CP-Social-Renderer':
-            '1.2.2-compressed',
+            '1.2.3-audio-duration-90s',
 
           'X-CP-Social-Resolution':
             `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`,
 
           'X-CP-Social-Text-Engine':
             'sharp-svg',
+
+          'X-CP-Social-Max-Duration':
+            String(
+              MAX_OUTPUT_DURATION
+            ),
         },
       }
     );
